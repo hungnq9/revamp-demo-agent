@@ -489,6 +489,105 @@ app.post('/api/email/send', async (req, res) => {
   }
 });
 
+// Send advanced email (with CC, BCC, Reply-To, attachments)
+app.post('/api/email/send-advanced', async (req, res) => {
+  try {
+    const {
+      to,
+      subject,
+      body,
+      from,
+      appPassword,
+      cc,
+      bcc,
+      replyTo,
+      attachments,  // Array of {filename, content(base64), contentType}
+    } = req.body;
+
+    if (!to || !subject || !body) {
+      res.status(400).json({ success: false, error: 'Thiếu to, subject hoặc body' });
+      return;
+    }
+
+    // Convert base64 attachments to buffer
+    const processedAttachments = attachments?.map((att: any) => ({
+      filename: att.filename,
+      content: att.content ? Buffer.from(att.content, 'base64') : undefined,
+      contentType: att.contentType,
+    }));
+
+    const result = await emailService.sendEmailAdvanced({
+      to,
+      subject,
+      body,
+      from,
+      appPassword,
+      cc,
+      bcc,
+      replyTo,
+      attachments: processedAttachments,
+    });
+
+    res.json({
+      success: result.success,
+      data: result.success ? { messageId: result.messageId } : undefined,
+      error: result.error,
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Send email with template
+app.post('/api/email/send-template', async (req, res) => {
+  try {
+    const {
+      to,
+      templateName,
+      templateData,
+      cc,
+      bcc,
+      replyTo,
+    } = req.body;
+
+    if (!to || !templateName || !templateData) {
+      res.status(400).json({ success: false, error: 'Thiếu to, templateName hoặc templateData' });
+      return;
+    }
+
+    const result = await emailService.sendTemplatedEmail(
+      to,
+      templateName as keyof typeof emailService.emailTemplates,
+      templateData,
+      { cc, bcc, replyTo }
+    );
+
+    res.json({
+      success: result.success,
+      data: result.success ? { messageId: result.messageId } : undefined,
+      error: result.error,
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get available email templates
+app.get('/api/email/templates', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      templates: ['welcome', 'completed', 'reminder', 'custom'],
+      descriptions: {
+        welcome: 'Email chào mừng merchant mới',
+        completed: 'Email thông báo hoàn thành onboarding',
+        reminder: 'Email nhắc nhở cung cấp tài liệu',
+        custom: 'Email custom với title và content tùy chỉnh',
+      },
+    },
+  });
+});
+
 // API Routes (bao gồm cả KB routes)
 app.use('/api', apiRoutes);
 
