@@ -406,7 +406,7 @@
         });
         const data = await res.json();
         hideTyping();
-        if (data.success) addBotMessage(data.data.message.replace(/\n/g, '<br>'), 'html', data.data.tools_used);
+        if (data.success) addBotMessage(renderMd(data.data.message), 'html', data.data.tools_used);
         else addBotMessage('❌ Xin lỗi, có lỗi xảy ra: ' + (data.error || 'Không xác định'));
       } catch (e) {
         hideTyping();
@@ -479,6 +479,17 @@
     function hideTyping() { isTyping = false; document.getElementById('typingIndicator').classList.remove('show'); }
     function scrollBottom() { const m = document.getElementById('messages'); m.scrollTop = m.scrollHeight; }
     function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+    // Lightweight Markdown -> HTML so **bold**, lists and --- render properly
+    function renderMd(t) {
+      if (t == null) return '';
+      return String(t)
+        .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')   // **bold**
+        .replace(/__([\s\S]+?)__/g, '<strong>$1</strong>')        // __bold__
+        .replace(/^\s*---\s*$/gm, '<hr>')                          // --- divider
+        .replace(/^[ \t]*[-*]\s+/gm, '• ')                         // - / * bullets
+        .replace(/\n/g, '<br>');                                   // newlines
+    }
   </script>
 </body>
 </html>
