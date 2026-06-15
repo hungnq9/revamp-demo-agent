@@ -11,6 +11,13 @@ const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost
 const GMAIL_EMAIL = process.env.GMAIL_EMAIL || '';
 const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD || '';
 
+// Generic SMTP config (supports Outlook/Office365, etc.)
+// Defaults to Gmail to preserve existing behaviour.
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+
 // Email attachment type
 export interface EmailAttachment {
   filename: string;
@@ -476,16 +483,17 @@ export async function sendEmailSimple(
   try {
     let transporter: nodemailer.Transporter;
 
-    // Use env vars if not provided
-    const email = fromEmail || GMAIL_EMAIL;
-    const password = appPassword || GMAIL_APP_PASSWORD;
+    // Use env vars if not provided (SMTP_* takes priority, falls back to Gmail)
+    const email = fromEmail || SMTP_USER || GMAIL_EMAIL;
+    const password = appPassword || SMTP_PASS || GMAIL_APP_PASSWORD;
 
     if (email && password) {
-      // Use App Password
+      // Use SMTP with username + (app) password — works for Gmail, Outlook/Office365, etc.
       transporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 587,
-        secure: false,
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_PORT === 465,      // 465 = SSL, 587 = STARTTLS
+        requireTLS: SMTP_PORT === 587,
         auth: {
           user: email,
           pass: password,
