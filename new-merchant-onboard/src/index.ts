@@ -122,7 +122,9 @@ function validateFileForPhase(fileName: string, phaseNumber?: number): {
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '..', 'public')));
+// index: false so the root route ('/') controls the homepage (Legal UI) instead of
+// express.static auto-serving public/index.html.
+app.use(express.static(path.join(__dirname, '..', 'public'), { index: false }));
 
 // ==================== MERCHANT STATUS TRACKING APIs ====================
 // API to get merchant status
@@ -1239,9 +1241,9 @@ async function lookupTaxId(companyName: string) {
   };
 }
 
-// Root endpoint
+// Root endpoint — this runtime is the Legal agent, so default to the Legal UI
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, '..', 'public', 'legal.html'));
 });
 
 // Memory endpoint: Generate memory records from session
