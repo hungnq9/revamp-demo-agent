@@ -484,6 +484,7 @@
     function renderMd(t) {
       if (t == null) return '';
       return String(t)
+        .replace(/^\s*#{1,6}\s+(.*)$/gm, '<strong>$1</strong>')   // # / ## / ### headings
         .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')   // **bold**
         .replace(/__([\s\S]+?)__/g, '<strong>$1</strong>')        // __bold__
         .replace(/^\s*---\s*$/gm, '<hr>')                          // --- divider
