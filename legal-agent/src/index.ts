@@ -7,30 +7,11 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import OpenAI from 'openai';
-import apiRoutes from './routes/api';
-import * as taxLookup from './services/tax-lookup';
 import * as emailService from './services/email';
-import * as kbService from './services/knowledge-base';
 import * as memoryService from './services/memory';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-
-// ==================== MERCHANT STATUS TRACKING ====================
-// In-memory merchant status (in production, use a database)
-interface MerchantStatus {
-  merchantName: string;
-  bdEmail: string;
-  phase: number;
-  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'IN_PROGRESS';
-  createdAt: string;
-  updatedAt: string;
-  documents: string[];
-  rejectionReason?: string;
-  complianceNotes?: string;
-}
-
-const merchantStatuses: Map<string, MerchantStatus> = new Map();
 
 // ==================== CONTRACT (LEGAL) REVIEW TRACKING ====================
 // In-memory contract review status (in production, use a database)
@@ -71,7 +52,6 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB max
   },
   fileFilter: (req, file, cb) => {
-    // Accept common document types
     const allowedTypes = [
       'application/pdf',
       'image/jpeg',
@@ -80,7 +60,6 @@ const upload = multer({
       'application/msword',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     ];
-
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -89,357 +68,24 @@ const upload = multer({
   },
 });
 
-// Validate file type based on phase
-function validateFileForPhase(fileName: string, phaseNumber?: number): {
-  valid: boolean;
-  message: string;
-} {
-  const fileNameLower = fileName.toLowerCase();
-
-  // Phase-specific validation
-  const phaseRequirements: Record<number, string[]> = {
-    1: ['giấy phép kinh doanh', 'gpkd', 'business license', 'certificate', 'đăng ký kinh doanh'],
-    2: ['hợp đồng', 'contract', 'draft', 'agreement', 'hd'],
-    3: ['tích hợp', 'integration', 'app id', 'api', 'thông tin'],
-    4: ['mã số thuế', 'mst', 'tax id', 'bank', 'tài khoản ngân hàng', 'account'],
-  };
-
-  if (phaseNumber && phaseRequirements[phaseNumber]) {
-    const requirements = phaseRequirements[phaseNumber];
-    const matches = requirements.some(req => fileNameLower.includes(req));
-
-    if (!matches) {
-      return {
-        valid: false,
-        message: `File "${fileName}" có vẻ không phù hợp với Phase ${phaseNumber}. Yêu cầu: ${requirements.join(', ')}`,
-      };
-    }
-  }
-
-  return { valid: true, message: 'File hợp lệ' };
-}
-
 // Middleware
 app.use(cors());
 app.use(express.json());
 // index: false so the root route ('/') controls the homepage (Legal UI) instead of
-// express.static auto-serving public/index.html.
+// express.static auto-serving an index.html.
 app.use(express.static(path.join(__dirname, '..', 'public'), { index: false }));
 
-// ==================== MERCHANT STATUS TRACKING APIs ====================
-// API to get merchant status
-app.get('/api/merchants/status', (req, res) => {
-  const merchants = Array.from(merchantStatuses.values());
-  res.json({ success: true, data: merchants });
-});
-
-// API to get merchant by name
-app.get('/api/merchants/:merchantName/status', (req, res) => {
-  const { merchantName } = req.params;
-  const status = merchantStatuses.get(merchantName.toLowerCase());
-
-  if (status) {
-    res.json({ success: true, data: status });
-  } else {
-    res.json({ success: false, error: 'Merchant not found' });
-  }
-});
-
-// API to submit merchant for compliance review (called when BD sends Phase 1 email)
-app.post('/api/merchants/submit-compliance', async (req, res) => {
-  try {
-    const { merchantName, bdEmail, documents } = req.body;
-
-    if (!merchantName || !bdEmail) {
-      res.status(400).json({ success: false, error: 'Thiếu merchantName hoặc bdEmail' });
-      return;
-    }
-
-    const key = merchantName.toLowerCase();
-    const now = new Date().toISOString();
-
-    const status: MerchantStatus = {
-      merchantName,
-      bdEmail,
-      phase: 1,
-      status: 'PENDING',
-      createdAt: now,
-      updatedAt: now,
-      documents: documents || [],
-    };
-
-    merchantStatuses.set(key, status);
-
-    // Notify Compliance team
-    const notifySubject = `[Onboarding] Có merchant mới chờ review - ${merchantName}`;
-    const notifyBody = `
-      <h2>Có hồ sơ merchant mới cần xem xét</h2>
-      <p><strong>Merchant:</strong> ${merchantName}</p>
-      <p><strong>BD:</strong> ${bdEmail}</p>
-      <p><strong>Phase:</strong> 1 - Thẩm định Merchant</p>
-      <p><strong>Trạng thái:</strong> ⏳ Chờ review</p>
-      <hr>
-      <p>Vui lòng login vào hệ thống để review: <a href="#">Link</a></p>
-    `;
-
-    // Send to Compliance PIC
-    await emailService.sendEmailSimple(
-      'hungnq9@vng.com.vn', // Compliance PIC
-      notifySubject,
-      notifyBody
-    );
-
-    res.json({
-      success: true,
-      data: status,
-      message: 'Đã submit merchant cho compliance review và gửi thông báo',
-    });
-  } catch (error: any) {
-    console.error('Submit compliance error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// API to get pending compliance reviews
-app.get('/api/compliance/pending', (req, res) => {
-  const pending = Array.from(merchantStatuses.values())
-    .filter(m => m.phase === 1 && m.status === 'PENDING');
-
-  res.json({ success: true, data: pending });
-});
-
-// LLM Configuration
+// ==================== LLM CONFIG ====================
 const LLM_API_KEY = process.env.LLM_API_KEY || '';
 const LLM_BASE_URL = 'https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1';
 const LLM_MODEL = 'minimax/minimax-m2.5';
 
-// Initialize OpenAI client
 const openai = new OpenAI({
   apiKey: LLM_API_KEY,
   baseURL: LLM_BASE_URL,
 });
 
-// Load knowledge base
-import knowledgeBaseData from './data/knowledge-base.json';
-const knowledgeBase = knowledgeBaseData as any;
-
-// System prompt for the agent
-const SYSTEM_PROMPT = `Bạn là Merchant Onboarding Agent, hỗ trợ Business Development (BD) tại Zalopay trong quá trình onboarding merchant mới.
-
-## Nhiệm vụ:
-- Giải đáp quy trình onboarding cho BD một cách CHUYÊN NGHIỆP, sử dụng markdown formatting đẹp mắt
-- Thu thập và kiểm tra tài liệu/thông tin từng phase
-- GỬI EMAIL THỰC cho Phase 1, 2, 4
-- Tạo Jira ticket cho Phase 3
-
-## QUAN TRONG VE FORMAT OUTPUT:
-- Khong dung cac ky tu dac biet: =  | # * ---
-- Chi su dung text thuan va dau gach ngang (-) cho danh sach
-- Tu khoa viet hoa: PIC, PHASE, MERCHANT, EMAIL, TICKET
-- Tra loi TIENG VIET CO DAU (có dấu)
-- Khi hien thi quy trinh phai dung exact formattedPhases tu tool
-
-## Cach hieu yeu cau BD:
-
-### 1. Khi BD muốn gửi email (Phase 1, 2, 4):
-Các cách BD có thể nói:
-- "tạo email phase 1/2/4"
-- "gửi email cho phase 1/2/4"
-- "email thẩm định merchant"
-- "gửi mail cho Khoa/TuPNC/ChienNM"
-- "review hợp đồng merchant"
-- "fa code merchant ABC"
-→ HÀNH ĐỘNG: GỬI EMAIL NGAY cho PIC tương ứng, KHÔNG cần xác nhận
-
-### 2. Khi BD nói "tiếp tục", "ok", "đồng ý":
-→ HÀNH ĐỘNG: Thực hiện ngay tác vụ trước đó, KHÔNG hỏi lại
-
-### 3. Khi BD muốn tạo ticket (Phase 3):
-Các cách BD có thể nói:
-- "tạo ticket phase 3"
-- "tạo jira ticket"
-- "tích hợp thanh toán"
-- "tạo app id"
-→ HÀNH ĐỘNG: Tạo Jira ticket cho NhanNĐT
-
-### 4. HỌC từ user:
-- Khi BD giải thích "ý tôi là...", "đây là...", hãy HỌC và NHỚ
-- VD: BD nói "gửi mail cho a Khoa" → hỏi → BD nói "ý tôi là gửi email Phase 1" → HỌC: "a Khoa" = Phase 1
-- Sau khi học, trả lời: "Tôi đã nhớ! 'a Khoa' = Phase 1. Gửi email ngay..."
-
-### 5. Quy tắc trả lời:
-- TRẢ LỜI NGẮN GỌN (1-2 câu) nhưng vẫn đẹp bằng markdown
-- KHÔNG HỎI NHIỀU CÂU HỎI
-- GỬI EMAIL/ TẠO TICKET NGAY khi hiểu ý BD
-- NHỚ context của conversation
-
-## Quy trình Onboarding (4 phases):
-
-### Phase 1: Thẩm định Merchant
-- Dept: Compliance
-- PIC: KhoaNVM (hungnq9@vng.com.vn)
-- Tasks: Review giấy phép kinh doanh
-- BD gửi: Giấy phép kinh doanh Merchant
-
-### Phase 2: Review Hợp đồng
-- Dept: Legal
-- PIC: TuPNC (namnk@vng.com.vn)
-- Tasks: LG review hợp đồng dịch vụ và các điều khoản điều chỉnh từ phía merchant
-- BD gửi: Draft hợp đồng (HĐ)
-
-### Phase 3: Tích hợp kỹ thuật
-- Dept: Tech
-- PIC: NhanNĐT (hieulv3@vng.com.vn)
-- Tasks: Tech team tạo App ID và hỗ trợ merchant tích hợp Zalopay Gateway API. Quy trình gồm 2 môi trường: Sandbox (test) và Production.
-- BD gửi: Jira ticket cho Tech team
-
-### Phase 4: Tạo FA Code
-- Dept: Accounting
-- PIC: ChienNM (quochung.ng4801.work@gmail.com)
-- Tasks: Tạo PaymentID (Mã FA), Mã thanh toán (P-xxxxx), cấu hình nguồn tiền bank/wallet
-- BD gửi: Mã số thuế, tài khoản ngân hàng nhận tiền
-
-## Cách giao tiếp:
-- Nói chuyện thân thiện bằng tiếng Việt
-- TRẢ LỜI NGẮN GỌN, KHÔNG HỎI NHIỀU CÂU HỎI
-- KHÔNG CẦN XÁC NHẬN - GỬI EMAIL NGAY khi BD yêu cầu
-- Nhớ các bước đã thực hiện trong conversation - không hỏi lại thông tin đã có
-- Khi BD nói "tiếp tục", "ok", "đồng ý" → THỰC HIỆN NGAY tác vụ trước đó
-- Khi BD yêu cầu tạo/gửi email cho Phase 1, 2, 4 → GỬI EMAIL NGAY lập tức mà KHÔNG cần xác nhận
-  - Phase 1 → Gửi đến KhoaNVM (hungnq9@vng.com.vn), subject: "[Onboarding] Thẩm định Merchant - {merchantName}"
-  - Phase 2 → Gửi đến TuPNC (namnk@vng.com.vn), subject: "[Onboarding] Review Hợp đồng - {merchantName}"
-  - Phase 4 → Gửi đến ChienNM (quochung.ng4801.work@gmail.com), subject: "[Onboarding] Tạo FA Code - {merchantName}"
-
-## Tools available:
-- get_phases: Lay danh sach tat ca cac phase. KHI CAN HIEN THI QUY TRINH, PHAI DUNG TRUC TIEP formattedPhases tu response cua tool, KHONG tu format lai
-- validate_documents: Kiem tra tai lieu BD nop co du khong
-- generate_email: Tao VA GUI email thuc cho PIC o Phase 1, 2, 4 (tu dong gui email that sau khi tao template)
-- generate_ticket: Tao ticket template cho Phase 3 (Tech)
-- send_real_email: Gui email thuc cho nguoi nhan bat ky (su dung Gmail App Password da duoc cau hinh)
-- simulate_send_email: Simulate gui email cho PIC (chi log, khong gui that - dung de preview truoc khi gui)
-- lookup_tax_id: Tra cuu ma so thue (MST) tu ten cong ty qua masothue.com
-
-## QUY TRAC: Khi user hoi ve quy trinh, PHAI dung formattedPhases tu get_phases tool, khong duoc tu viet lai`;
-
-// Compliance Agent System Prompt
-const COMPLIANCE_SYSTEM_PROMPT = `Bạn là Compliance Review Agent, hỗ trợ đội Compliance tại Zalopay trong việc xem xét và phê duyệt hồ sơ merchant.
-
-## Nhiệm vụ:
-- Nhận thông báo khi BD gửi email yêu cầu review Phase 1 (Thẩm định Merchant)
-- Xem xét giấy phép kinh doanh và tài liệu liên quan
-- Quyết định APPROVE hoặc REJECT với lý do cụ thể
-- Gửi thông báo cho BD khi hoàn thành review
-
-## QUAN TRONG VE FORMAT OUTPUT:
-- Khong dung cac ky tu dac biet: =  | # * ---
-- Chi su dung text thuan va dau gach ngang (-) cho danh sach
-- Tra loi TIENG VIET CO DAU (có dấu)
-
-## Cách xử lý:
-
-### 1. Khi nhận được yêu cầu review:
-- Xác nhận đã nhận được hồ sơ
-- Liệt kê các tài liệu đã nhận được
-- Thông báo đang tiến hành review
-
-### 2. Khi quyết định APPROVE:
-- Gửi email xác nhận cho BD
-- Thông báo: "Hồ sơ đã được phê duyệt. BD có thể tiến hành Phase 2."
-- Cập nhật trạng thái: APPROVED
-
-### 3. Khi quyết định REJECT:
-- Nêu rõ lý do từ chối (giấy phép hết hạn, thiếu giấy tờ, thông tin không hợp lệ,...)
-- Đề xuất các bước cần thiết để BD bổ sung
-- Cập nhật trạng thái: REJECTED
-
-### 4. Khi BD gửi thêm tài liệu bổ sung:
-- Review lại tài liệu mới
-- Quyết định APPROVE hoặc REJECT
-
-## Thông tin Phase 1:
-- Dept: Compliance
-- PIC: KhoaNVM (hungnq9@vng.com.vn)
-- Tasks: Review giấy phép kinh doanh
-- Required: Giấy phép kinh doanh
-
-## Tools available:
-- get_phases: Lay danh sach tat ca cac phase
-- send_approval_notification: Gui thong bao cho BD khi phê duyệt
-- send_rejection_notification: Gui thong bao cho BD khi từ chối
-- send_real_email: Gui email thực cho BD hoặc người liên quan
-
-## QUY TRAC:
-- Phải có action cụ thể (APPROVE/REJECT) mới gửi thông báo
-- Không tự động approve - phải chờ Compliance confirm`;
-
-const COMPLIANCE_TOOLS: any = [
-  {
-    type: 'function',
-    function: {
-      name: 'get_phases',
-      description: 'Tra ve thong tin quy trinh onboarding',
-      parameters: {
-        type: 'object',
-        properties: {},
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_approval_notification',
-      description: 'Gui thong bao phê duyệt cho BD sau khi Compliance confirm',
-      parameters: {
-        type: 'object',
-        properties: {
-          merchantName: { type: 'string', description: 'Tên merchant' },
-          bdEmail: { type: 'string', description: 'Email của BD để thông báo' },
-          notes: { type: 'string', description: 'Ghi chú thêm (tùy chọn)' },
-        },
-        required: ['merchantName', 'bdEmail'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_rejection_notification',
-      description: 'Gui thong bao từ chối cho BD kèm lý do',
-      parameters: {
-        type: 'object',
-        properties: {
-          merchantName: { type: 'string', description: 'Tên merchant' },
-          bdEmail: { type: 'string', description: 'Email của BD để thông báo' },
-          reason: { type: 'string', description: 'Lý do từ chối cụ thể' },
-          requiredActions: { type: 'array', items: { type: 'string' }, description: 'Các bước BD cần làm để bổ sung' },
-        },
-        required: ['merchantName', 'bdEmail', 'reason'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_real_email',
-      description: 'Gui email thực cho người nhận',
-      parameters: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: 'Email người nhận' },
-          subject: { type: 'string', description: 'Tiêu đề email' },
-          body: { type: 'string', description: 'Nội dung email (HTML allowed)' },
-          fromEmail: { type: 'string', description: 'Email người gửi (tùy chọn)' },
-          appPassword: { type: 'string', description: 'Gmail App Password (tùy chọn)' },
-        },
-        required: ['to', 'subject', 'body'],
-      },
-    },
-  },
-];
-
 // ==================== LEGAL AGENT (PHASE 2 - CONTRACT REVIEW) ====================
-// Legal Agent System Prompt
 const LEGAL_SYSTEM_PROMPT = `Bạn là Legal Contract Review Agent, hỗ trợ đội Legal tại Zalopay trong việc rà soát và phê duyệt hợp đồng dịch vụ merchant (Phase 2 - Review Hợp đồng).
 
 ## Nhiệm vụ:
@@ -509,11 +155,7 @@ const LEGAL_TOOLS: any = [
     function: {
       name: 'get_phases',
       description: 'Tra ve thong tin quy trinh onboarding',
-      parameters: {
-        type: 'object',
-        properties: {},
-        required: [],
-      },
+      parameters: { type: 'object', properties: {}, required: [] },
     },
   },
   {
@@ -587,632 +229,40 @@ const LEGAL_TOOLS: any = [
   },
 ];
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
 // Health check endpoint (required by AgentBase)
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Email OAuth endpoints
-app.get('/api/email/auth', (req, res) => {
-  try {
-    const authUrl = emailService.getAuthUrl();
-    res.json({
-      success: true,
-      data: { authUrl },
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+// Root endpoint — this runtime is the Legal agent, so default to the Legal UI
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'legal.html'));
 });
 
-app.post('/api/email/callback', async (req, res) => {
-  try {
-    const { code } = req.body;
-    if (!code) {
-      res.status(400).json({ success: false, error: 'Thiếu authorization code' });
-      return;
-    }
-
-    await emailService.setCredentials(code);
-    res.json({
-      success: true,
-      message: 'Đã kết nối Gmail thành công!',
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get('/api/email/status', (req, res) => {
-  const hasCreds = emailService.hasCredentials();
-  res.json({
-    success: true,
-    data: { connected: hasCreds },
-  });
-});
-
-// Send email endpoint
-app.post('/api/email/send', async (req, res) => {
-  try {
-    const { to, subject, body, fromEmail, appPassword } = req.body;
-
-    if (!to || !subject || !body) {
-      res.status(400).json({ success: false, error: 'Thiếu to, subject hoặc body' });
-      return;
-    }
-
-    const result = await emailService.sendEmailSimple(to, subject, body, fromEmail, appPassword);
-
-    res.json({
-      success: result.success,
-      data: result.success ? { messageId: result.messageId } : undefined,
-      error: result.error,
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Send advanced email (with CC, BCC, Reply-To, attachments)
-app.post('/api/email/send-advanced', async (req, res) => {
-  try {
-    const {
-      to,
-      subject,
-      body,
-      from,
-      appPassword,
-      cc,
-      bcc,
-      replyTo,
-      attachments,  // Array of {filename, content(base64), contentType}
-    } = req.body;
-
-    if (!to || !subject || !body) {
-      res.status(400).json({ success: false, error: 'Thiếu to, subject hoặc body' });
-      return;
-    }
-
-    // Convert base64 attachments to buffer
-    const processedAttachments = attachments?.map((att: any) => ({
-      filename: att.filename,
-      content: att.content ? Buffer.from(att.content, 'base64') : undefined,
-      contentType: att.contentType,
-    }));
-
-    const result = await emailService.sendEmailAdvanced({
-      to,
-      subject,
-      body,
-      from,
-      appPassword,
-      cc,
-      bcc,
-      replyTo,
-      attachments: processedAttachments,
-    });
-
-    res.json({
-      success: result.success,
-      data: result.success ? { messageId: result.messageId } : undefined,
-      error: result.error,
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Send email with template
-app.post('/api/email/send-template', async (req, res) => {
-  try {
-    const {
-      to,
-      templateName,
-      templateData,
-      cc,
-      bcc,
-      replyTo,
-    } = req.body;
-
-    if (!to || !templateName || !templateData) {
-      res.status(400).json({ success: false, error: 'Thiếu to, templateName hoặc templateData' });
-      return;
-    }
-
-    const result = await emailService.sendTemplatedEmail(
-      to,
-      templateName as keyof typeof emailService.emailTemplates,
-      templateData,
-      { cc, bcc, replyTo }
-    );
-
-    res.json({
-      success: result.success,
-      data: result.success ? { messageId: result.messageId } : undefined,
-      error: result.error,
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Get available email templates
-app.get('/api/email/templates', (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      templates: ['welcome', 'completed', 'reminder', 'custom'],
-      descriptions: {
-        welcome: 'Email chào mừng merchant mới',
-        completed: 'Email thông báo hoàn thành onboarding',
-        reminder: 'Email nhắc nhở cung cấp tài liệu',
-        custom: 'Email custom với title và content tùy chỉnh',
-      },
-    },
-  });
-});
-
-// API Routes (bao gồm cả KB routes)
-app.use('/api', apiRoutes);
-
-// Multer error handler
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      res.status(400).json({ success: false, error: 'File quá lớn. Vui lòng upload file nhỏ hơn 10MB.' });
-    } else {
-      res.status(400).json({ success: false, error: err.message });
-    }
-  } else if (err) {
-    res.status(400).json({ success: false, error: err.message });
-  } else {
-    next();
-  }
-});
-
-// List uploaded files
-app.get('/api/files', (req, res) => {
-  try {
-    fs.readdir(uploadsDir, (err, files) => {
-      if (err) {
-        res.status(500).json({ success: false, error: 'Không thể đọc danh sách file' });
-        return;
-      }
-
-      const fileInfos = files.map(file => {
-        const filePath = path.join(uploadsDir, file);
-        const stats = fs.statSync(filePath);
-        return {
-          name: file,
-          path: `/uploads/${file}`,
-          size: stats.size,
-          created: stats.birthtime,
-        };
-      });
-
-      res.json({
-        success: true,
-        data: fileInfos,
-      });
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Serve uploaded files
-app.use('/uploads', express.static(uploadsDir));
-
-// Tax lookup endpoint
-app.post('/api/tax-lookup', async (req, res) => {
-  try {
-    const { companyName } = req.body;
-
-    if (!companyName) {
-      res.status(400).json({ success: false, error: 'Thiếu tên công ty' });
-      return;
-    }
-
-    const taxInfo = await taxLookup.lookupTaxId(companyName);
-
-    if (taxInfo) {
-      res.json({
-        success: true,
-        data: taxInfo,
-      });
-    } else {
-      res.json({
-        success: false,
-        error: 'Không tìm thấy thông tin MST cho công ty này',
-      });
-    }
-  } catch (error: any) {
-    console.error('Tax lookup error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Lỗi khi tra cứu MST',
-    });
-  }
-});
-
-// AI Chat endpoint with file upload support and memory integration
-app.post('/api/chat', upload.single('file'), async (req, res) => {
-  try {
-    const message = req.body.message || '';
-    let context: any[] = [];
-    if (req.body.context) {
-      try {
-        context = typeof req.body.context === 'string' ? JSON.parse(req.body.context) : req.body.context;
-      } catch (e) {
-        context = [];
-      }
-    }
-    const file = req.file;
-
-    if (!message && !file) {
-      res.status(400).json({ success: false, error: 'Thiếu message hoặc file' });
-      return;
-    }
-
-    // Get user/session from headers (provided by AgentBase Runtime)
-    // Fall back to default for local development
-    const userId = req.headers['x-greennode-agentbase-user-id'] as string || 'default-user';
-    const sessionId = req.headers['x-greennode-agentbase-session-id'] as string || `session-${Date.now()}`;
-
-    // Memory integration: Search for relevant context
-    let memoryContext = '';
-    try {
-      const relevantRecords = await memoryService.searchMemoryRecords(userId, message, 5);
-      if (relevantRecords && relevantRecords.length > 0) {
-        memoryContext = '\n\n## Thông tin đã học từ trước:\n' +
-          relevantRecords.map(r => `- ${r.memory}`).join('\n');
-      }
-    } catch (memError) {
-      console.warn('[Memory] Could not search records:', memError);
-    }
-
-    // Build the user message with file info if present
-    let userMessage = message;
-    let fileUploadInfo = '';
-
-    // Phase detection using KB service
-    const detectPhase = (msg: string): number | undefined => {
-      return kbService.detectPhase(msg);
-    };
-
-    // Check for feedback/learning patterns
-    const feedback = kbService.isFeedback(message);
-    let isLearningMode = false;
-    if (feedback) {
-      // Try to extract phase from the meaning
-      const phaseFromMeaning = detectPhase(feedback.meaning);
-      if (phaseFromMeaning) {
-        // Learn the original phrase with the detected phase
-        kbService.learnPhrase(message, phaseFromMeaning, feedback.meaning);
-        isLearningMode = true;
-      }
-    }
-
-    if (file) {
-      // Validate file type based on message content (try to detect phase from message)
-      const detectedPhase = detectPhase(message);
-
-      // Validate file name for the detected phase
-      const validation = validateFileForPhase(file.originalname, detectedPhase);
-
-      fileUploadInfo = `
-[File đính kèm]:
-- Tên file: ${file.originalname}
-- Kích thước: ${file.size} bytes
-- Đường dẫn: ${file.path}
-- Trạng thái: ${validation.valid ? '✅ Hợp lệ' : '⚠️ Cảnh báo: ' + validation.message}
-`;
-
-      // If message is empty but file is present, provide a default message
-      if (!message) {
-        userMessage = `Tôi đã upload file "${file.originalname}". Vui lòng kiểm tra và xác nhận file đã được lưu thành công.`;
-      }
-      userMessage = message + fileUploadInfo;
-    }
-
-    // Compress old history if needed (before adding system prompt and new message)
-    let compressedContext = context;
-    if (context && context.length >= 10) {
-      compressedContext = await summarizeOldHistory(context, openai, LLM_MODEL);
-    }
-
-    // Build messages for LLM
-    const systemPromptWithMemory = SYSTEM_PROMPT + (memoryContext || '');
-    const messages = [
-      { role: 'system', content: systemPromptWithMemory },
-      ...(compressedContext || []),
-      { role: 'user', content: userMessage },
-    ];
-
-    // Call LLM with tools
-    const response = await openai.chat.completions.create({
-      model: LLM_MODEL,
-      messages: messages,
-      temperature: 0.7,
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'get_phases',
-            description: 'Tra ve thong tin quy trinh onboarding. Chi tra ve text thuan, KHONG tra ve JSON',
-            parameters: {
-              type: 'object',
-              properties: {},
-              required: [],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'validate_documents',
-            description: 'Kiểm tra xem BD đã nộp đủ tài liệu cần thiết cho một phase chưa',
-            parameters: {
-              type: 'object',
-              properties: {
-                phaseNumber: { type: 'number', description: 'Số phase (1-4)' },
-                documents: { type: 'array', items: { type: 'string' }, description: 'Danh sách tài liệu BD đã nộp' },
-              },
-              required: ['phaseNumber', 'documents'],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'generate_email',
-            description: 'Tạo VÀ GỬI email thực cho PIC (chỉ dùng cho Phase 1, 2, 4). Email sẽ được gửi ngay sau khi tạo template.',
-            parameters: {
-              type: 'object',
-              properties: {
-                phaseNumber: { type: 'number', description: 'Số phase (1, 2, hoặc 4)' },
-                merchantName: { type: 'string', description: 'Tên merchant mới' },
-              },
-              required: ['phaseNumber', 'merchantName'],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'generate_ticket',
-            description: 'Tạo Jira ticket cho Phase 3 (Tích hợp kỹ thuật)',
-            parameters: {
-              type: 'object',
-              properties: {
-                merchantName: { type: 'string', description: 'Tên merchant mới' },
-                paymentMethods: {
-                  type: 'object',
-                  properties: {
-                    zalopay: { type: 'boolean' },
-                    vqr: { type: 'boolean' },
-                    creditCard: { type: 'boolean' },
-                  },
-                  required: ['zalopay', 'vqr', 'creditCard'],
-                },
-              },
-              required: ['merchantName', 'paymentMethods'],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'send_real_email',
-            description: 'Gửi email thực cho người nhận. Sử dụng tool này khi BD yêu cầu gửi email thật (không phải simulate)',
-            parameters: {
-              type: 'object',
-              properties: {
-                to: { type: 'string', description: 'Email người nhận' },
-                subject: { type: 'string', description: 'Tiêu đề email' },
-                body: { type: 'string', description: 'Nội dung email (HTML allowed)' },
-                fromEmail: { type: 'string', description: 'Email người gửi (tùy chọn)' },
-                appPassword: { type: 'string', description: 'Gmail App Password (tùy chọn, nếu không dùng OAuth2)' },
-              },
-              required: ['to', 'subject', 'body'],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'simulate_send_email',
-            description: 'Simulate gửi email cho PIC',
-            parameters: {
-              type: 'object',
-              properties: {
-                to: { type: 'string', description: 'Email người nhận' },
-                subject: { type: 'string', description: 'Tiêu đề email' },
-                body: { type: 'string', description: 'Nội dung email' },
-              },
-              required: ['to', 'subject', 'body'],
-            },
-          },
-        },
-        {
-          type: 'function',
-          function: {
-            name: 'lookup_tax_id',
-            description: 'Tra cứu mã số thuế (MST) của một công ty từ tên công ty qua nguồn masothue.com',
-            parameters: {
-              type: 'object',
-              properties: {
-                companyName: { type: 'string', description: 'Tên công ty cần tra cứu MST' },
-              },
-              required: ['companyName'],
-            },
-          },
-        },
-      ],
-      tool_choice: 'auto',
-    });
-
-    const assistantMessage = response.choices[0]?.message;
-    const toolCalls = assistantMessage?.tool_calls || [];
-
-    // If there are tool calls, execute them
-    let toolResults: any[] = [];
-    if (toolCalls.length > 0) {
-      for (const toolCall of toolCalls) {
-        // Handle both function and custom tool call types
-        const func = (toolCall as any).function;
-        if (!func) continue;
-
-        const toolName = func.name;
-        const toolArgs = JSON.parse(func.arguments);
-
-        let result: any;
-        switch (toolName) {
-          case 'get_phases':
-            result = await getPhases();
-            break;
-          case 'validate_documents':
-            result = await validateDocuments(toolArgs.phaseNumber, toolArgs.documents);
-            break;
-          case 'generate_email':
-            result = await generateEmail(toolArgs.phaseNumber, toolArgs.merchantName);
-            break;
-          case 'generate_ticket':
-            result = await generateTicket(toolArgs.merchantName, toolArgs.paymentMethods);
-            break;
-          case 'send_real_email':
-            result = await sendRealEmail(toolArgs.to, toolArgs.subject, toolArgs.body, toolArgs.fromEmail, toolArgs.appPassword);
-            break;
-          case 'simulate_send_email':
-            result = await simulateSendEmail(toolArgs.to, toolArgs.subject, toolArgs.body);
-            break;
-          case 'lookup_tax_id':
-            result = await lookupTaxId(toolArgs.companyName);
-            break;
-          default:
-            result = { error: 'Unknown tool' };
-        }
-
-        toolResults.push({
-          tool_call_id: toolCall.id,
-          role: 'tool',
-          content: JSON.stringify(result),
-        });
-      }
-
-      // Call LLM again with tool results
-      const secondResponse = await openai.chat.completions.create({
-        model: LLM_MODEL,
-        messages: [
-          ...messages,
-          assistantMessage!,
-          ...toolResults,
-        ],
-        temperature: 0.7,
-      });
-
-      const finalMessage = secondResponse.choices[0]?.message?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
-      // Save conversation to memory (fire and forget - don't block response)
-      memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
-      memoryService.createEvent(userId, sessionId, 'assistant', finalMessage).catch(() => {});
-
-      res.json({
-        success: true,
-        data: {
-          message: finalMessage,
-          tools_used: toolCalls.map(tc => (tc as any).function?.name).filter(Boolean),
-        },
-      });
-    } else {
-      // No tool calls, just return the message
-      const assistantMsg = assistantMessage?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
-      // Save conversation to memory (fire and forget - don't block response)
-      memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
-      memoryService.createEvent(userId, sessionId, 'assistant', assistantMsg).catch(() => {});
-
-      res.json({
-        success: true,
-        data: {
-          message: assistantMsg,
-          tools_used: [],
-        },
-      });
-    }
-  } catch (error: any) {
-    console.error('Chat error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Lỗi khi xử lý yêu cầu',
-    });
-  }
-});
-
-// Tool implementations
-import * as onboardingAgent from './services/onboarding-agent';
-
+// ==================== TOOL IMPLEMENTATIONS ====================
 async function getPhases() {
-  const result = onboardingAgent.getProcessOverview();
-  // Return ONLY the formatted string to force the LLM to use it
-  return result.formattedPhases;
-}
+  return `Quy trình Onboarding Merchant tại Zalopay (4 Phase):
 
-async function validateDocuments(phaseNumber: number, documents: string[]) {
-  return onboardingAgent.validateDocuments({ phaseNumber, documents });
-}
+Phase 1: Thẩm định Merchant
+- Phòng ban: Compliance | PIC: KhoaNVM
+- Nội dung: Review giấy phép kinh doanh và hồ sơ pháp lý của merchant
 
-async function generateEmail(phaseNumber: number, merchantName: string) {
-  // If merchantName is not provided or unclear, use a default
-  const actualMerchantName = merchantName && merchantName.length > 2 ? merchantName : 'Merchant mới';
+Phase 2: Review Hợp đồng  (Legal phụ trách)
+- Phòng ban: Legal | PIC: TuPNC (namnk@vng.com.vn)
+- Nội dung: Rà soát hợp đồng dịch vụ và các điều khoản điều chỉnh từ phía merchant
+- Tài liệu BD gửi: Draft hợp đồng
 
-  // Get the email template
-  const emailTemplate = onboardingAgent.generateEmail({
-    phaseNumber,
-    merchantInfo: { merchantName: actualMerchantName },
-  });
+Phase 3: Tích hợp kỹ thuật
+- Phòng ban: Tech | PIC: NhanNĐT
+- Nội dung: Tạo App ID và hỗ trợ tích hợp Zalopay Gateway API
 
-  // Send the actual email
-  const sendResult = await emailService.sendEmailSimple(
-    emailTemplate.to,
-    emailTemplate.subject,
-    emailTemplate.body
-  );
-
-  if (sendResult.success) {
-    return {
-      ...emailTemplate,
-      sent: true,
-      messageId: sendResult.messageId,
-      message: `✅ Email đã được gửi thành công đến ${emailTemplate.to}!`,
-    };
-  }
-
-  return {
-    ...emailTemplate,
-    sent: false,
-    error: sendResult.error,
-    message: `❌ Gửi email thất bại: ${sendResult.error}`,
-  };
-}
-
-async function generateTicket(merchantName: string, paymentMethods: any) {
-  return onboardingAgent.generateTicket({ merchantName, paymentMethods });
-}
-
-async function simulateSendEmail(to: string, subject: string, body: string) {
-  return onboardingAgent.simulateSendEmail({
-    email: { to, subject, body },
-  });
+Phase 4: Tạo FA Code
+- Phòng ban: Accounting | PIC: ChienNM
+- Nội dung: Tạo PaymentID (Mã FA) và cấu hình nguồn tiền`;
 }
 
 async function sendRealEmail(to: string, subject: string, body: string, fromEmail?: string, appPassword?: string) {
   const result = await emailService.sendEmailSimple(to, subject, body, fromEmail, appPassword);
-
   if (result.success) {
     return {
       success: true,
@@ -1220,359 +270,23 @@ async function sendRealEmail(to: string, subject: string, body: string, fromEmai
       message: `Email đã được gửi thành công đến ${to}`,
     };
   }
-
   return {
     success: false,
     error: result.error || 'Không thể gửi email',
   };
 }
 
-async function lookupTaxId(companyName: string) {
-  const result = await taxLookup.lookupTaxId(companyName);
-  if (result) {
-    return {
-      found: true,
-      ...result,
-    };
-  }
-  return {
-    found: false,
-    message: `Không tìm thấy MST cho công ty: ${companyName}`,
-  };
-}
-
-// Root endpoint — this runtime is the Legal agent, so default to the Legal UI
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '..', 'public', 'legal.html'));
-});
-
-// Memory endpoint: Generate memory records from session
-app.post('/api/memory/generate', async (req, res) => {
-  try {
-    const userId = req.headers['x-greennode-agentbase-user-id'] as string || 'default-user';
-    const sessionId = req.body.sessionId;
-
-    if (!sessionId) {
-      res.status(400).json({ success: false, error: 'Thiếu sessionId' });
-      return;
-    }
-
-    const result = await memoryService.generateMemoryRecordsFromSession(userId, sessionId);
-    res.json({ success: true, data: result });
-  } catch (error: any) {
-    console.error('Memory generate error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Memory endpoint: List memory records
-app.get('/api/memory/records', async (req, res) => {
-  try {
-    const userId = req.headers['x-greennode-agentbase-user-id'] as string || 'default-user';
-    const records = await memoryService.listMemoryRecords(userId);
-    res.json({ success: true, data: records });
-  } catch (error: any) {
-    console.error('Memory list error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ==================== COMPLIANCE ENDPOINT ====================
-// Compliance Chat endpoint - for Compliance team to review and approve/reject merchant applications
-
-app.post('/api/chat/compliance', upload.single('file'), async (req, res) => {
-  try {
-    const message = req.body.message || '';
-    let context: any[] = [];
-    if (req.body.context) {
-      try {
-        context = typeof req.body.context === 'string' ? JSON.parse(req.body.context) : req.body.context;
-      } catch (e) {
-        context = [];
-      }
-    }
-    const file = req.file;
-
-    if (!message && !file) {
-      res.status(400).json({ success: false, error: 'Thiếu message hoặc file' });
-      return;
-    }
-
-    // Get user/session from headers
-    const userId = req.headers['x-greennode-agentbase-user-id'] as string || 'compliance-user';
-    const sessionId = req.headers['x-greennode-agentbase-session-id'] as string || `compliance-${Date.now()}`;
-
-    // Build user message with file info if present
-    let userMessage = message;
-    let fileUploadInfo = '';
-
-    if (file) {
-      fileUploadInfo = `
-[Tài liệu đính kèm]:
-- Tên file: ${file.originalname}
-- Kích thước: ${file.size} bytes
-- Đường dẫn: ${file.path}
-`;
-
-      if (!message) {
-        userMessage = `Tôi đã upload file "${file.originalname}" để review.`;
-      } else {
-        userMessage = message + fileUploadInfo;
-      }
-    }
-
-    // Compress old context if needed
-    let compressedContext = context;
-    if (context && context.length >= 10) {
-      compressedContext = await summarizeOldHistory(context, openai, LLM_MODEL);
-    }
-
-    // Build messages for LLM
-    const messages = [
-      { role: 'system', content: COMPLIANCE_SYSTEM_PROMPT },
-      ...(compressedContext || []),
-      { role: 'user', content: userMessage },
-    ];
-
-    // Call LLM with compliance tools
-    const response = await openai.chat.completions.create({
-      model: LLM_MODEL,
-      messages: messages,
-      temperature: 0.7,
-      tools: COMPLIANCE_TOOLS,
-      tool_choice: 'auto',
-    });
-
-    const assistantMessage = response.choices[0]?.message;
-    const toolCalls = assistantMessage?.tool_calls || [];
-
-    // If there are tool calls, execute them
-    let toolResults: any[] = [];
-    if (toolCalls.length > 0) {
-      for (const toolCall of toolCalls) {
-        const func = (toolCall as any).function;
-        if (!func) continue;
-
-        const toolName = func.name;
-        const toolArgs = JSON.parse(func.arguments);
-
-        let result: any;
-        switch (toolName) {
-          case 'get_phases':
-            result = await getPhases();
-            break;
-          case 'send_approval_notification':
-            result = await sendApprovalNotification(toolArgs.merchantName, toolArgs.bdEmail, toolArgs.notes);
-            break;
-          case 'send_rejection_notification':
-            result = await sendRejectionNotification(toolArgs.merchantName, toolArgs.bdEmail, toolArgs.reason, toolArgs.requiredActions);
-            break;
-          case 'send_real_email':
-            result = await sendRealEmail(toolArgs.to, toolArgs.subject, toolArgs.body, toolArgs.fromEmail, toolArgs.appPassword);
-            break;
-          default:
-            result = { error: 'Unknown tool' };
-        }
-
-        toolResults.push({
-          tool_call_id: toolCall.id,
-          role: 'tool',
-          content: JSON.stringify(result),
-        });
-      }
-
-      // Call LLM again with tool results
-      const secondResponse = await openai.chat.completions.create({
-        model: LLM_MODEL,
-        messages: [
-          ...messages,
-          assistantMessage!,
-          ...toolResults,
-        ],
-        temperature: 0.7,
-      });
-
-      const finalMessage = secondResponse.choices[0]?.message?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
-      // Save to memory
-      memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
-      memoryService.createEvent(userId, sessionId, 'assistant', finalMessage).catch(() => {});
-
-      res.json({
-        success: true,
-        data: {
-          message: finalMessage,
-          tools_used: toolCalls.map(tc => (tc as any).function?.name).filter(Boolean),
-        },
-      });
-    } else {
-      const assistantMsg = assistantMessage?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
-      memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
-      memoryService.createEvent(userId, sessionId, 'assistant', assistantMsg).catch(() => {});
-
-      res.json({
-        success: true,
-        data: {
-          message: assistantMsg,
-          tools_used: [],
-        },
-      });
-    }
-  } catch (error: any) {
-    console.error('Compliance chat error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Lỗi khi xử lý yêu cầu',
-    });
-  }
-});
-
-// Compliance review endpoint - explicit approve/reject actions
-app.post('/api/compliance/review', async (req, res) => {
-  try {
-    const { merchantName, bdEmail, action, reason, notes } = req.body;
-
-    if (!merchantName || !bdEmail || !action) {
-      res.status(400).json({ success: false, error: 'Thiếu thông tin bắt buộc: merchantName, bdEmail, action' });
-      return;
-    }
-
-    if (action !== 'approve' && action !== 'reject') {
-      res.status(400).json({ success: false, error: 'Action phải là "approve" hoặc "reject"' });
-      return;
-    }
-
-    let result;
-    if (action === 'approve') {
-      result = await sendApprovalNotification(merchantName, bdEmail, notes);
-    } else {
-      const requiredActions = notes ? notes.split(';').map((s: string) => s.trim()) : [];
-      result = await sendRejectionNotification(merchantName, bdEmail, reason || 'Không có lý do cụ thể', requiredActions);
-    }
-
-    res.json({
-      success: true,
-      data: result,
-    });
-  } catch (error: any) {
-    console.error('Compliance review error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Helper functions for Compliance
-async function sendApprovalNotification(merchantName: string, bdEmail: string, notes?: string) {
-  // Update merchant status
-  const key = merchantName.toLowerCase();
-  const existingStatus = merchantStatuses.get(key);
-  if (existingStatus) {
-    existingStatus.status = 'APPROVED';
-    existingStatus.updatedAt = new Date().toISOString();
-    existingStatus.complianceNotes = notes;
-    merchantStatuses.set(key, existingStatus);
-  }
-
-  const subject = `[Onboarding] ✅ Phê duyệt Phase 1 - ${merchantName}`;
-  const body = `
-    <h2>Thông báo phê duyệt hồ sơ merchant</h2>
-    <p>Kính gửi BD,</p>
-    <p>Hồ sơ merchant <strong>${merchantName}</strong> đã được Compliance xem xét và <strong>PHÊ DUYỆT</strong>.</p>
-    <p><strong>Trạng thái:</strong> ✅ APPROVED</p>
-    <p><strong>Phase 1 hoàn thành!</strong> BD có thể tiến hành Phase 2 (Review Hợp đồng).</p>
-    ${notes ? `<p><strong>Ghi chú:</strong> ${notes}</p>` : ''}
-    <hr>
-    <p>Trân trọng,<br>Compliance Team</p>
-  `;
-
-  const emailResult = await emailService.sendEmailSimple(bdEmail, subject, body);
-
-  if (emailResult.success) {
-    return {
-      action: 'approve',
-      merchantName,
-      bdEmail,
-      status: 'APPROVED',
-      message: `✅ Đã gửi thông báo phê duyệt cho BD (${bdEmail})`,
-      messageId: emailResult.messageId,
-    };
-  }
-
-  return {
-    action: 'approve',
-    merchantName,
-    bdEmail,
-    status: 'APPROVED',
-    message: `❌ Không thể gửi email: ${emailResult.error}`,
-    error: emailResult.error,
-  };
-}
-
-async function sendRejectionNotification(merchantName: string, bdEmail: string, reason: string, requiredActions?: string[]) {
-  // Update merchant status
-  const key = merchantName.toLowerCase();
-  const existingStatus = merchantStatuses.get(key);
-  if (existingStatus) {
-    existingStatus.status = 'REJECTED';
-    existingStatus.updatedAt = new Date().toISOString();
-    existingStatus.rejectionReason = reason;
-    merchantStatuses.set(key, existingStatus);
-  }
-
-  const subject = `[Onboarding] ❌ Từ chối Phase 1 - ${merchantName}`;
-  const actionsText = requiredActions && requiredActions.length > 0
-    ? requiredActions.map(a => `- ${a}`).join('<br>')
-    : '- Bổ sung tài liệu theo yêu cầu';
-
-  const body = `
-    <h2>Thông báo từ chối hồ sơ merchant</h2>
-    <p>Kính gửi BD,</p>
-    <p>Hồ sơ merchant <strong>${merchantName}</strong> đã được Compliance xem xét và <strong>TỪ CHỐI</strong>.</p>
-    <p><strong>Trạng thái:</strong> ❌ REJECTED</p>
-    <p><strong>Lý do từ chối:</strong> ${reason}</p>
-    <p><strong>BD cần bổ sung:</strong><br>${actionsText}</p>
-    <hr>
-    <p>Trân trọng,<br>Compliance Team</p>
-  `;
-
-  const emailResult = await emailService.sendEmailSimple(bdEmail, subject, body);
-
-  if (emailResult.success) {
-    return {
-      action: 'reject',
-      merchantName,
-      bdEmail,
-      status: 'REJECTED',
-      reason,
-      message: `✅ Đã gửi thông báo từ chối cho BD (${bdEmail})`,
-      messageId: emailResult.messageId,
-    };
-  }
-
-  return {
-    action: 'reject',
-    merchantName,
-    bdEmail,
-    status: 'REJECTED',
-    reason,
-    message: `❌ Không thể gửi email: ${emailResult.error}`,
-    error: emailResult.error,
-  };
-}
-
-// ==================== LEGAL ENDPOINTS (PHASE 2 - CONTRACT REVIEW) ====================
-
-// API to get all contract reviews (for Legal pending list)
+// ==================== CONTRACT REVIEW APIs ====================
+// List all contract reviews (for Legal pending list)
 app.get('/api/contracts/status', (req, res) => {
   const contracts = Array.from(contractReviews.values());
   res.json({ success: true, data: contracts });
 });
 
-// API to get contract review by merchant name
+// Get contract review by merchant name
 app.get('/api/contracts/:merchantName/status', (req, res) => {
   const { merchantName } = req.params;
   const status = contractReviews.get(merchantName.toLowerCase());
-
   if (status) {
     res.json({ success: true, data: status });
   } else {
@@ -1580,19 +294,17 @@ app.get('/api/contracts/:merchantName/status', (req, res) => {
   }
 });
 
-// API to get pending legal reviews
+// Get pending legal reviews
 app.get('/api/legal/pending', (req, res) => {
   const pending = Array.from(contractReviews.values())
     .filter(c => c.phase === 2 && c.status === 'PENDING');
-
   res.json({ success: true, data: pending });
 });
 
-// API to submit contract for legal review (called when BD sends Phase 2 email)
+// Submit contract for legal review (called when BD sends Phase 2 request)
 app.post('/api/contracts/submit-legal', async (req, res) => {
   try {
     const { merchantName, bdEmail, contractVersion, documents } = req.body;
-
     if (!merchantName || !bdEmail) {
       res.status(400).json({ success: false, error: 'Thiếu merchantName hoặc bdEmail' });
       return;
@@ -1600,7 +312,6 @@ app.post('/api/contracts/submit-legal', async (req, res) => {
 
     const key = merchantName.toLowerCase();
     const now = new Date().toISOString();
-
     const status: ContractReviewStatus = {
       merchantName,
       bdEmail,
@@ -1611,7 +322,6 @@ app.post('/api/contracts/submit-legal', async (req, res) => {
       updatedAt: now,
       documents: documents || [],
     };
-
     contractReviews.set(key, status);
 
     // Notify Legal team
@@ -1624,28 +334,18 @@ app.post('/api/contracts/submit-legal', async (req, res) => {
       <p><strong>Phase:</strong> 2 - Review Hợp đồng</p>
       <p><strong>Trạng thái:</strong> ⏳ Chờ rà soát</p>
       <hr>
-      <p>Vui lòng login vào hệ thống để rà soát: <a href="#">Link</a></p>
+      <p>Vui lòng login vào hệ thống để rà soát.</p>
     `;
+    await emailService.sendEmailSimple('vnglegal@gmail.com', notifySubject, notifyBody);
 
-    // Send to Legal PIC
-    await emailService.sendEmailSimple(
-      'vnglegal@gmail.com', // Legal PIC (LG team inbox)
-      notifySubject,
-      notifyBody
-    );
-
-    res.json({
-      success: true,
-      data: status,
-      message: 'Đã submit hợp đồng cho Legal review và gửi thông báo',
-    });
+    res.json({ success: true, data: status, message: 'Đã submit hợp đồng cho Legal review và gửi thông báo' });
   } catch (error: any) {
     console.error('Submit legal error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Legal Chat endpoint - for Legal team to review and approve/reject/request-revision contracts
+// ==================== LEGAL CHAT ENDPOINT ====================
 app.post('/api/chat/legal', upload.single('file'), async (req, res) => {
   try {
     const message = req.body.message || '';
@@ -1668,21 +368,14 @@ app.post('/api/chat/legal', upload.single('file'), async (req, res) => {
     const sessionId = req.headers['x-greennode-agentbase-session-id'] as string || `legal-${Date.now()}`;
 
     let userMessage = message;
-    let fileUploadInfo = '';
-
     if (file) {
-      fileUploadInfo = `
+      const fileUploadInfo = `
 [Tài liệu đính kèm]:
 - Tên file: ${file.originalname}
 - Kích thước: ${file.size} bytes
 - Đường dẫn: ${file.path}
 `;
-
-      if (!message) {
-        userMessage = `Tôi đã upload file "${file.originalname}" để rà soát hợp đồng.`;
-      } else {
-        userMessage = message + fileUploadInfo;
-      }
+      userMessage = message ? message + fileUploadInfo : `Tôi đã upload file "${file.originalname}" để rà soát hợp đồng.`;
     }
 
     let compressedContext = context;
@@ -1746,59 +439,39 @@ app.post('/api/chat/legal', upload.single('file'), async (req, res) => {
 
       const secondResponse = await openai.chat.completions.create({
         model: LLM_MODEL,
-        messages: [
-          ...messages,
-          assistantMessage!,
-          ...toolResults,
-        ],
+        messages: [...messages, assistantMessage!, ...toolResults],
         temperature: 0.7,
       });
 
       const finalMessage = secondResponse.choices[0]?.message?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
       memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
       memoryService.createEvent(userId, sessionId, 'assistant', finalMessage).catch(() => {});
 
       res.json({
         success: true,
-        data: {
-          message: finalMessage,
-          tools_used: toolCalls.map(tc => (tc as any).function?.name).filter(Boolean),
-        },
+        data: { message: finalMessage, tools_used: toolCalls.map(tc => (tc as any).function?.name).filter(Boolean) },
       });
     } else {
       const assistantMsg = assistantMessage?.content || 'Xin lỗi, tôi không thể xử lý yêu cầu của bạn.';
-
       memoryService.createEvent(userId, sessionId, 'user', userMessage).catch(() => {});
       memoryService.createEvent(userId, sessionId, 'assistant', assistantMsg).catch(() => {});
 
-      res.json({
-        success: true,
-        data: {
-          message: assistantMsg,
-          tools_used: [],
-        },
-      });
+      res.json({ success: true, data: { message: assistantMsg, tools_used: [] } });
     }
   } catch (error: any) {
     console.error('Legal chat error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Lỗi khi xử lý yêu cầu',
-    });
+    res.status(500).json({ success: false, error: error.message || 'Lỗi khi xử lý yêu cầu' });
   }
 });
 
-// Legal review endpoint - explicit approve/reject/revision actions
+// ==================== LEGAL REVIEW ACTION ENDPOINT ====================
 app.post('/api/legal/review', async (req, res) => {
   try {
     const { merchantName, bdEmail, action, reason, revisionItems, notes } = req.body;
-
     if (!merchantName || !bdEmail || !action) {
       res.status(400).json({ success: false, error: 'Thiếu thông tin bắt buộc: merchantName, bdEmail, action' });
       return;
     }
-
     if (action !== 'approve' && action !== 'reject' && action !== 'revision') {
       res.status(400).json({ success: false, error: 'Action phải là "approve", "reject" hoặc "revision"' });
       return;
@@ -1816,17 +489,14 @@ app.post('/api/legal/review', async (req, res) => {
       result = await sendLegalRevision(merchantName, bdEmail, items, notes);
     }
 
-    res.json({
-      success: true,
-      data: result,
-    });
+    res.json({ success: true, data: result });
   } catch (error: any) {
     console.error('Legal review error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Helper functions for Legal
+// ==================== LEGAL HELPERS ====================
 async function sendLegalApproval(merchantName: string, bdEmail: string, contractVersion?: string, notes?: string) {
   const key = merchantName.toLowerCase();
   const existingStatus = contractReviews.get(key);
@@ -1850,28 +520,12 @@ async function sendLegalApproval(merchantName: string, bdEmail: string, contract
     <hr>
     <p>Trân trọng,<br>Legal Team</p>
   `;
-
   const emailResult = await emailService.sendEmailSimple(bdEmail, subject, body);
 
   if (emailResult.success) {
-    return {
-      action: 'approve',
-      merchantName,
-      bdEmail,
-      status: 'APPROVED',
-      message: `✅ Đã gửi thông báo phê duyệt hợp đồng cho BD (${bdEmail})`,
-      messageId: emailResult.messageId,
-    };
+    return { action: 'approve', merchantName, bdEmail, status: 'APPROVED', message: `✅ Đã gửi thông báo phê duyệt hợp đồng cho BD (${bdEmail})`, messageId: emailResult.messageId };
   }
-
-  return {
-    action: 'approve',
-    merchantName,
-    bdEmail,
-    status: 'APPROVED',
-    message: `❌ Không thể gửi email: ${emailResult.error}`,
-    error: emailResult.error,
-  };
+  return { action: 'approve', merchantName, bdEmail, status: 'APPROVED', message: `❌ Không thể gửi email: ${emailResult.error}`, error: emailResult.error };
 }
 
 async function sendLegalRejection(merchantName: string, bdEmail: string, reason: string, reasonCode?: string) {
@@ -1895,30 +549,12 @@ async function sendLegalRejection(merchantName: string, bdEmail: string, reason:
     <hr>
     <p>Trân trọng,<br>Legal Team</p>
   `;
-
   const emailResult = await emailService.sendEmailSimple(bdEmail, subject, body);
 
   if (emailResult.success) {
-    return {
-      action: 'reject',
-      merchantName,
-      bdEmail,
-      status: 'REJECTED',
-      reason,
-      message: `✅ Đã gửi thông báo từ chối hợp đồng cho BD (${bdEmail})`,
-      messageId: emailResult.messageId,
-    };
+    return { action: 'reject', merchantName, bdEmail, status: 'REJECTED', reason, message: `✅ Đã gửi thông báo từ chối hợp đồng cho BD (${bdEmail})`, messageId: emailResult.messageId };
   }
-
-  return {
-    action: 'reject',
-    merchantName,
-    bdEmail,
-    status: 'REJECTED',
-    reason,
-    message: `❌ Không thể gửi email: ${emailResult.error}`,
-    error: emailResult.error,
-  };
+  return { action: 'reject', merchantName, bdEmail, status: 'REJECTED', reason, message: `❌ Không thể gửi email: ${emailResult.error}`, error: emailResult.error };
 }
 
 async function sendLegalRevision(merchantName: string, bdEmail: string, revisionItems: string[], notes?: string) {
@@ -1947,33 +583,15 @@ async function sendLegalRevision(merchantName: string, bdEmail: string, revision
     <hr>
     <p>Trân trọng,<br>Legal Team</p>
   `;
-
   const emailResult = await emailService.sendEmailSimple(bdEmail, subject, body);
 
   if (emailResult.success) {
-    return {
-      action: 'revision',
-      merchantName,
-      bdEmail,
-      status: 'REVISION_REQUESTED',
-      revisionItems,
-      message: `✅ Đã gửi yêu cầu chỉnh sửa hợp đồng cho BD (${bdEmail})`,
-      messageId: emailResult.messageId,
-    };
+    return { action: 'revision', merchantName, bdEmail, status: 'REVISION_REQUESTED', revisionItems, message: `✅ Đã gửi yêu cầu chỉnh sửa hợp đồng cho BD (${bdEmail})`, messageId: emailResult.messageId };
   }
-
-  return {
-    action: 'revision',
-    merchantName,
-    bdEmail,
-    status: 'REVISION_REQUESTED',
-    revisionItems,
-    message: `❌ Không thể gửi email: ${emailResult.error}`,
-    error: emailResult.error,
-  };
+  return { action: 'revision', merchantName, bdEmail, status: 'REVISION_REQUESTED', revisionItems, message: `❌ Không thể gửi email: ${emailResult.error}`, error: emailResult.error };
 }
 
-// Update summarizeOldHistory to be reusable
+// Conversation history compression for long chats
 async function summarizeOldHistory(history: any[], openaiClient: any, model: string) {
   if (history.length < 10) return history;
 
@@ -1983,37 +601,41 @@ async function summarizeOldHistory(history: any[], openaiClient: any, model: str
   try {
     const summary = await openaiClient.chat.completions.create({
       model: model,
-      messages: [{
-        role: "user",
-        content: `Summarize this agent conversation history concisely,保留重要信息:\n${JSON.stringify(toSummarize)}`
-      }],
+      messages: [{ role: 'user', content: `Summarize this agent conversation history concisely:\n${JSON.stringify(toSummarize)}` }],
       max_tokens: 1000,
       temperature: 0.3,
     });
-
     const summaryText = summary.choices[0]?.message?.content || '';
-    return [{ role: "assistant", content: `[Lịch sử trước đó]: ${summaryText}` }, ...recent];
+    return [{ role: 'assistant', content: `[Lịch sử trước đó]: ${summaryText}` }, ...recent];
   } catch (err) {
     console.warn('[History] Summarization failed, using original history:', err);
     return history;
   }
 }
 
+// Multer error handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      res.status(400).json({ success: false, error: 'File quá lớn. Vui lòng upload file nhỏ hơn 10MB.' });
+    } else {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  } else if (err) {
+    res.status(400).json({ success: false, error: err.message });
+  } else {
+    next();
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Merchant Onboarding Agent (AI) is running on http://localhost:${PORT}`);
-  console.log(`💬 Chat endpoints:`);
-  console.log(`   - POST /api/chat                    - BD: Onboard merchant`);
-  console.log(`   - POST /api/chat/compliance         - Compliance: Review & approve/reject`);
-  console.log(`   - POST /api/chat/legal              - Legal: Review HĐ & approve/reject/revision`);
+  console.log(`🚀 Legal Contract Review Agent is running on http://localhost:${PORT}`);
+  console.log(`💬 Chat endpoint:`);
+  console.log(`   - POST /api/chat/legal               - Legal: Review HĐ & approve/reject/revision`);
   console.log(`📋 API endpoints:`);
-  console.log(`   - GET  /api/onboarding/phases        - Get all phases`);
-  console.log(`   - POST /api/onboarding/validate      - Validate documents`);
-  console.log(`   - POST /api/onboarding/email         - Generate email`);
-  console.log(`   - POST /api/onboarding/ticket        - Generate ticket`);
-  console.log(`   - POST /api/onboarding/send          - Simulate send email`);
-  console.log(`   - POST /api/compliance/review        - Compliance: Approve/Reject action`);
-  console.log(`   - POST /api/contracts/submit-legal   - BD: Submit HĐ cho Legal review`);
-  console.log(`   - GET  /api/contracts/status         - Legal: Danh sách HĐ chờ rà soát`);
-  console.log(`   - POST /api/legal/review             - Legal: Approve/Reject/Revision action`);
+  console.log(`   - POST /api/contracts/submit-legal   - Submit HĐ cho Legal review`);
+  console.log(`   - GET  /api/contracts/status         - Danh sách HĐ chờ rà soát`);
+  console.log(`   - GET  /api/legal/pending            - HĐ đang chờ (PENDING)`);
+  console.log(`   - POST /api/legal/review             - Approve/Reject/Revision action`);
 });
