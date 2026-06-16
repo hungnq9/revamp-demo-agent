@@ -48,10 +48,11 @@
       top: 0;
       z-index: 100;
     }
-    .logo { height: 32px; display: flex; align-items: center; gap: 8px; }
-    .logo img { height: 100%; }
-    .logo-text { font-size: 20px; font-weight: 700; color: var(--zp-blue); }
-    .header-title { font-size: 14px; font-weight: 500; color: var(--zp-text-muted); margin-left: auto; }
+    .logo { display: flex; align-items: center; gap: 8px; }
+    .logo img { height: 60px; }
+    .logo-text { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, var(--zp-blue) 0%, var(--zp-green) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .header-title { font-size: 14px; font-weight: 500; color: var(--zp-text-muted); margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .header-badge { background: var(--zp-purple); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
 
     /* Main Container */
     .container {
@@ -96,7 +97,7 @@
       transition: all 0.2s;
       border: 1px solid var(--zp-border);
     }
-    .contract-item:hover { background: var(--zp-bg); }
+    .contract-item:hover { background: var(--zp-bg); border-color: var(--zp-blue); transform: translateX(4px); }
     .contract-item.active { background: rgba(0, 51, 201, 0.06); border-color: var(--zp-blue); }
     .contract-item .merchant-name { font-size: 14px; font-weight: 600; color: var(--zp-text); margin-bottom: 2px; }
     .contract-item .bd-email { font-size: 12px; color: var(--zp-text-muted); margin-bottom: 8px; word-break: break-all; }
@@ -249,9 +250,11 @@
   <header class="header">
     <div class="logo">
       <img src="/logo.png" alt="Zalopay" onerror="this.style.display='none'">
-      <span class="logo-text">Zalopay</span>
     </div>
-    <span class="header-title">Legal Contract Review</span>
+    <span class="header-title">
+      Legal Contract Review Agent
+      <span class="header-badge">POV: Legal</span>
+    </span>
   </header>
 
   <!-- Main Container -->
@@ -272,9 +275,8 @@
     <!-- Chat Area -->
     <div class="chat-area">
       <div class="chat-header">
-        <div class="chat-avatar">
-          <img src="/logo.png" alt="Zalopay" style="width:24px;height:24px;object-fit:contain;" onerror="this.parentElement.textContent='LG'">
-        </div>
+        <img src="/logo.png" alt="Zalopay" style="width:40px;height:40px;border-radius:12px;object-fit:contain;">
+
         <div>
           <div class="chat-title">Legal Review Agent</div>
           <div class="chat-subtitle">Rà soát & phê duyệt hợp đồng merchant</div>
@@ -469,7 +471,8 @@
       const toolsHtml = (tools && tools.length) ? `<div class="tools-used">Tools: ${tools.join(', ')}</div>` : '';
       document.getElementById('messages').innerHTML += `
         <div class="message bot">
-          <div class="message-avatar">LG</div>
+          <img src="/logo.png" alt="LG" style="width:32px;height:32px;border-radius:10px;object-fit:contain;flex-shrink:0;">
+
           <div class="message-content"><div class="message-text">${format === 'html' ? html : escapeHtml(html)}</div>${toolsHtml}<div class="message-time">${nowTime()}</div></div>
         </div>`;
       scrollBottom();
